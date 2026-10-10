@@ -29,6 +29,7 @@ export class Lights {
     moveLightsComputePipeline: GPUComputePipeline;
 
     // TODO-2: add layouts, pipelines, textures, etc. needed for light clustering here
+    clusterSetStorageBuffer: GPUBuffer;
 
     constructor(camera: Camera) {
         this.camera = camera;
@@ -94,6 +95,17 @@ export class Lights {
         });
 
         // TODO-2: initialize layouts, pipelines, textures, etc. needed for light clustering here
+        const numClusters = shaders.constants.clusterCountX
+                  * shaders.constants.clusterCountY
+                  * shaders.constants.clusterCountZ;
+        const bytesPerCluster = (1 + shaders.constants.maxLightsPerCluster) * 4;
+
+        this.clusterSetStorageBuffer = device.createBuffer({
+            label: "cluster set",
+            size: numClusters * bytesPerCluster,
+            usage: GPUBufferUsage.STORAGE
+        });
+    
     }
 
     private populateLightsBuffer() {
