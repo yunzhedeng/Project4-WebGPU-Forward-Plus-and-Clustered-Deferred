@@ -75,8 +75,6 @@ None. This renderer is intentionally the unoptimized reference.
 
 ## 2. Forward+ Renderer(with light clustering)
 
-### Overview
-
 Forward+ eliminates much of the wasted effort on lighting calculation that occurred due to Naive by doing a pre-calculation step where they determine what lights can possibly have an effect on which portion of the screen. They subdivide the view frustum into 3456 clusters of size 16 x 9 x 24, using exponential depth slices (`z_k = near · (far/near)^(k/24)`), so that the clusters will remain cubical under perspective projection. Each frame, a compute shader is executed, one thread per cluster, which constructs the axis-aligned bounding box for the cluster from its 8 corners in view space, performs a collision test between the light sphere (radius 2) and the bounding box, and stores up to 256 overlapping light indices in a storage buffer. During rendering, each fragment determines the cluster it belongs to using its screen coordinates and view space depth, and iterates over that cluster's lights only.
 
 ### Performance
@@ -116,59 +114,68 @@ Forward+ adds a light-clustering compute pass every frame that tests every light
 
 ![Lights per cluster](img/debug_cluster_lights.png)
 
-Brightness shows the number of lights in each pixel's cluster. Brighter regions
-mean longer per-fragment light loops, so the debug view maps directly to where
-the fragment shader spends its time: frames where much of the screen is bright
-are the slow ones.
+*Forward+, 500 lights. Brightness = number of lights in the pixel's cluster / 64 (white means 64 or more).*
+
+The 16 × 9 tiles in the cluster grid are obvious and easily identifiable as blocks of uniform intensity. Within a single tile, intensity will vary based on depth edges (such as those on the arches in the center), since surfaces at different depths will be assigned to different depth slices, demonstrating that the clusters are indeed 3D and not just 2D tiling. The brightest section is that at the far end of the hall in the middle of the screen, since exponential depth slicing gives distant clusters much greater volume and more overlapping lights. It is easy to see how this is reflected in performance – the brighter pixels are those that take the most fragment shader iterations through light loops, so the brighter the screen (more lights, or long hall), the higher the frame time.
 
 ---
 
 ## 3. Clustered Deferred
 
-### Overview
-
-Pass 1 rasterizes the scene into a G-buffer (albedo, normal, world position) and
-a depth buffer without doing any lighting. Pass 2 draws one fullscreen triangle;
-for each pixel it reads the G-buffer, finds the cluster (reusing the Forward+
-clustering), and loops over that cluster's lights **once**. The clustering
-compute pass runs first, before the G-buffer pass.
-
-### Screenshot and G-buffer debug views
-
-| Albedo                 | Normal                 | Position                 | Final                         |
-| ---------------------- | ---------------------- | ------------------------ | ----------------------------- |
-| ![](img/gbuf_albedo.png) | ![](img/gbuf_normal.png) | ![](img/gbuf_position.png) | ![](img/clustered_deferred.png) |
-
-__These debug views are optional: output a G-buffer texture as the final color
-temporarily to capture them.__
+Clustered Deferred uses the exact same light clustering compute pass as the Forward+ pipeline does, except Clustered Deferred renders in two passes so that lighting is computed once per visible pixel. The first pass (G-buffer pass) renders the scene without lighting; all the fragment shader does is write the albedo (in `rgba8unorm`), normals (in `rgba16float`), and positions (in `rgba32float`) of surfaces to three render targets, with the depth test making sure only the closest surface per-pixel is rendered. In the second pass, a fullscreen triangle is drawn; the fragment shader looks up the G-buffer using `textureLoad` and computes the pixel's cluster, then iterates through the cluster's lights and generates the final color.
 
 ### Performance
 
-- At 500 lights: Forward+ __ ms vs. Clustered Deferred __ ms.
-- At 5000 lights: Forward+ __ ms vs. Clustered Deferred __ ms.
-- Breakdown (if timestamp queries are used): clustering __ ms, G-buffer __ ms,
-  fullscreen lighting __ ms.
+| numLights | Clustered Deferred frame time (ms) |
+| --------: | ---------------------------------: |
+|       100 |                               2.10 |
+|       500 |                               2.93 |
+|      1000 |                               4.28 |
+|      2000 |                               7.86 |
+|      5000 |                              11.40 |
 
-![Forward+ vs Clustered Deferred](img/graph_deferred.png)
+![Forward+ vs Clustered Deferred](img/graph_forward_vs_deferred.png)
 
 ### Analysis
 
-- **Is one faster?** 【根据上表填写】
-- **Better at which workloads?** 【Clustered Deferred is better with many lights
-  and high overdraw, because lighting is evaluated once per visible pixel.
-  Forward+ is better with few lights or low overdraw, because it avoids the
-  G-buffer bandwidth.】
-- **Benefits of Deferred**: lighting cost is independent of scene geometry
-  complexity; no wasted lighting on hidden fragments.
-- **Tradeoffs of Deferred**: G-buffer traffic of 8 + 8 + 16 = 32 bytes per pixel
-  written and read back each frame; transparency and MSAA are hard to support.
-- **Why the difference**: 【explain what your data shows: Forward+ pays the
-  lighting cost per rasterized fragment (including hidden ones); Deferred pays
-  bandwidth for the G-buffer instead.】
-- **Effect of parameters**: G-buffer cost depends only on resolution; lighting
-  cost grows with numLights and light radius.
-- **Further optimization**: compress the G-buffer (see G-buffer optimization),
-  or reconstruct position from depth.
+#### Performance improvement
+
+Against Forward+, Clustered Deferred scores even at 100 lights (2.08 vs. 2.10 ms), but surpasses it in terms of performance as the number of lights increases: 2.1 times faster at 500 lights (6.21 → 2.93 ms), 3.0 times at 1000 lights, 3.2 times at 2000 lights, and 4.1 times at 5000 lights (46.86 → 11.40 ms). In addition, its time per frame also
+rises more slowly than that of Forward+, increasing only 0.002 ms for each additional light versus 0.009 ms for Forward+. Against Naive, it performs 68 times better at 5000 lights (780.3 → 11.4 ms).
+
+#### Best and worst case
+
+- **Best case**: many lights and high overdraw, where many fragments overlap at each pixel. Forward+ would light every one of those fragments; Deferred lights only the one visible surface per pixel, so the savings are largest.
+- **Worst case**: few lights and little overdraw. Lighting is then cheap anyway, and the fixed cost of writing and reading the G-buffer cancels out the savings. At 100 lights, Deferred is no faster than Forward+ (2.10 vs. 2.08 ms).
+
+#### Tradeoffs
+
+Deferred requires an additional three full-screen render targets, each taking up 32 bytes per pixel (8 + 8 + 16). These need to be written in the G-buffer pass and re-read in the lighting pass on every frame, requiring additional memory and bandwidth costs that increase with screen resolution. Since G-buffers contain only one surface per pixel, there is no way of handling transparency or forward passes for MSAA, because the transparent surfaces need to be stored separately in their own forward pass.
+
+#### How parameters affect performance
+
+- **Number of lights**: affects only the clustering pass and the lighting pass. Frame time grows from 2.10 to 11.40 ms between 100 and 5000 lights, a farsmaller slope than Forward+ because each light is evaluated at most once per pixel.
+- **Resolution**: affects both the G-buffer cost (bytes written and read) and the lighting pass (one evaluation per pixel), but not scene complexity.
+- **Scene depth complexity / overdraw**: barely affects lighting cost, since only the closest surface per pixel survives into the G-buffer. This is the main difference from Forward+.
+
+#### Debug view: G-buffer
+
+| Albedo                    | Normal                    |
+| ------------------------- | ------------------------- |
+| ![](img/gbuffer_albedo.png) | ![](img/gbuffer_normal.png) |
+
+The G-buffer stores exactly one surface per pixel: everything hidden behind it has already been discarded by the depth test, which is why the lighting pass does no wasted work on overdraw.
+
+### Forward+ vs. Clustered Deferred
+
+**Is one of them faster?** Clustered Deferred is faster at every light count above 100: 2.1× at 500 lights and 4.1× at 5000 lights. At 100 lights the two tie (2.08 vs. 2.10 ms).
+
+**Is one better at certain workloads?** Deferred is better with many lights and high overdraw, where Forward+ wastes lighting on hidden fragments. Forward+ is better with few lights and little overdraw, where the G-buffer cost is not worth paying, and when transparency, MSAA, or many different materials are needed.
+
+**Benefits and tradeoffs.** Deferred rendering lights every visible pixel only once, and hence is independent of the depth complexity of the scene; however, it has a cost of 32 bytes of G-buffer memory for every pixel and cannot easily manage transparency or MSAA. Forward+ needs no G-buffer and handles any material or transparency, but it lights every rasterized fragment, including those later hidden.
+
+**What causes the difference?** The renderers apply the same clustering pass and the frame for Deferred renderer is computed in just 11.4 ms at 5000 lights; thus, the clustering process takes not more than this time. The additional ~35 ms spent in Forward+ should then be attributed to fragment shading. In Forward+ renderer the loop through cluster lights is executed for each fragment rasterized, while there is lots of overdraw in Sponza (model columns, arches, curtains), which means many fragments are completely lit and then overwritten. In Deferred renderer the loop is executed once for each visible
+fragment. With 100 lights, the loop becomes short, and this gain is small and offset by the cost of G-buffer write/read operations.
 
 ### Credits
 

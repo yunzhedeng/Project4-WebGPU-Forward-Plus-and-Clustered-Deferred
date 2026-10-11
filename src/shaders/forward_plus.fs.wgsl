@@ -61,6 +61,7 @@ fn main(in: FragmentInput) -> @location(0) vec4f
     let clusterIdx = getClusterIndex(in.fragPos.xy, in.pos);
     let numLightsInCluster = clusterSet.clusters[clusterIdx].numLights;
 
+
     let nor = normalize(in.nor);
 
     var totalLightContrib = vec3f(0, 0, 0);
