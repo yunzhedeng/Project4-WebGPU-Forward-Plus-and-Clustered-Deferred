@@ -13,7 +13,7 @@ WebGL Forward+ and Clustered Deferred Shading
 
 ### Demo Video/GIF
 
-[![](img/video.mp4)](TODO)
+ ![Demo](img/demo.gif)
 
 ## Overview
 
