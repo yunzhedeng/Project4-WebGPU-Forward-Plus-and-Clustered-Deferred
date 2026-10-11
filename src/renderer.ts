@@ -126,6 +126,29 @@ export abstract class Renderer {
 
     protected abstract draw(): void;
 
+    //benchmark
+    async benchmark(frames: number = 200, warmup: number = 20): Promise<number> {
+        cancelAnimationFrame(this.frameRequestId);
+
+        for (let i = 0; i < warmup; i++) {
+            this.lights.onFrame(performance.now());
+            this.draw();
+        }
+        await device.queue.onSubmittedWorkDone();
+
+        const start = performance.now();
+        for (let i = 0; i < frames; i++) {
+            this.lights.onFrame(performance.now());
+            this.draw();
+        }
+        await device.queue.onSubmittedWorkDone();
+        const ms = (performance.now() - start) / frames;
+
+        this.frameRequestId = requestAnimationFrame((t) => this.onFrame(t));
+        return ms;
+    }
+
+
     // CHECKITOUT: this is the main rendering loop
     private onFrame(time: number) {
         if (this.prevTime == 0) {

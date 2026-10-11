@@ -53,4 +53,11 @@ const renderModes = { naive: 'naive', forwardPlus: 'forward+', clusteredDeferred
 let renderModeController = gui.add({ mode: renderModes.naive }, 'mode', renderModes);
 renderModeController.onChange(setRenderer);
 
+gui.add({
+    benchmark: async () => {
+        const ms = await renderer!.benchmark(200);
+        console.log(`[benchmark] mode=${renderModeController.getValue()} numLights=${lights.numLights} -> ${ms.toFixed(3)} ms/frame`);
+    }
+}, 'benchmark');
+
 setRenderer(renderModeController.getValue());
