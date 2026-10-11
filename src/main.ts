@@ -1,10 +1,10 @@
 import Stats from 'stats.js';
 import { GUI } from 'dat.gui';
 
-import { initWebGPU, Renderer } from './renderer';
 import { NaiveRenderer } from './renderers/naive';
 import { ForwardPlusRenderer } from './renderers/forward_plus';
 import { ClusteredDeferredRenderer } from './renderers/clustered_deferred';
+import { initWebGPU, Renderer, settings } from './renderer';
 
 import { setupLoaders, Scene } from './stage/scene';
 import { Lights } from './stage/lights';
@@ -53,10 +53,12 @@ const renderModes = { naive: 'naive', forwardPlus: 'forward+', clusteredDeferred
 let renderModeController = gui.add({ mode: renderModes.naive }, 'mode', renderModes);
 renderModeController.onChange(setRenderer);
 
+gui.add(settings, 'useRenderBundles');
+
 gui.add({
     benchmark: async () => {
-        const ms = await renderer!.benchmark(200);
-        console.log(`[benchmark] mode=${renderModeController.getValue()} numLights=${lights.numLights} -> ${ms.toFixed(3)} ms/frame`);
+        const { ms, cpuMs } = await renderer!.benchmark(200);
+        console.log(`[benchmark] mode=${renderModeController.getValue()} numLights=${lights.numLights} bundles=${settings.useRenderBundles} -> ${ms.toFixed(3)} ms/frame, CPU draw() ${cpuMs.toFixed(3)} ms`);
     }
 }, 'benchmark');
 

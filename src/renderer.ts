@@ -2,6 +2,11 @@ import { Scene } from './stage/scene';
 import { Lights } from './stage/lights';
 import { Camera } from './stage/camera';
 import { Stage } from './stage/stage';
+import * as shaders from './shaders/shaders';
+
+export const settings = {
+    useRenderBundles: true
+};
 
 export var canvas: HTMLCanvasElement;
 export var canvasFormat: GPUTextureFormat;
@@ -124,6 +129,18 @@ export abstract class Renderer {
         cancelAnimationFrame(this.frameRequestId);
     }
 
+    protected recordSceneDraws(pass: GPURenderPassEncoder | GPURenderBundleEncoder) {
+        this.scene.iterate(node => {
+            pass.setBindGroup(shaders.constants.bindGroup_model, node.modelBindGroup);
+        }, material => {
+            pass.setBindGroup(shaders.constants.bindGroup_material, material.materialBindGroup);
+        }, primitive => {
+            pass.setVertexBuffer(0, primitive.vertexBuffer);
+            pass.setIndexBuffer(primitive.indexBuffer, 'uint32');
+            pass.drawIndexed(primitive.numIndices);
+        });
+    }
+
     protected abstract draw(): void;
 
     //benchmark
@@ -136,16 +153,20 @@ export abstract class Renderer {
         }
         await device.queue.onSubmittedWorkDone();
 
+        let cpuTime = 0;  
         const start = performance.now();
         for (let i = 0; i < frames; i++) {
             this.lights.onFrame(performance.now());
+            const t0 = performance.now();         
             this.draw();
+            cpuTime += performance.now() - t0;     
         }
+       
         await device.queue.onSubmittedWorkDone();
         const ms = (performance.now() - start) / frames;
 
         this.frameRequestId = requestAnimationFrame((t) => this.onFrame(t));
-        return ms;
+        return { ms, cpuMs: cpuTime / frames };
     }
 
 

@@ -18,6 +18,7 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
     gBufferSceneBindGroupLayout: GPUBindGroupLayout;
     gBufferSceneBindGroup: GPUBindGroup;
     gBufferPipeline: GPURenderPipeline;
+    gBufferBundle: GPURenderBundle;
 
     fullscreenBindGroupLayout: GPUBindGroupLayout;
     fullscreenBindGroup: GPUBindGroup;
@@ -30,7 +31,7 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
 
         // TODO-3: initialize layouts, pipelines, textures, etc. needed for Forward+ here
         // you'll need two pipelines: one for the G-buffer pass and one for the fullscreen pass
-         this.albedoTexture = renderer.device.createTexture({
+        this.albedoTexture = renderer.device.createTexture({
             label: "gbuffer albedo",
             size: size,
             format: "rgba8unorm",
@@ -190,6 +191,17 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
                 ]
             }
         });
+        // Pre-record the G-buffer pass draw calls
+        const gBufferBundleEncoder = renderer.device.createRenderBundleEncoder({
+            label: "G-buffer render bundle",
+            colorFormats: ["rgba8unorm", "rgba16float", "rgba32float"],
+            depthStencilFormat: "depth24plus"
+        });
+        gBufferBundleEncoder.setPipeline(this.gBufferPipeline);
+        gBufferBundleEncoder.setBindGroup(shaders.constants.bindGroup_scene, this.gBufferSceneBindGroup);
+        this.recordSceneDraws(gBufferBundleEncoder);
+        this.gBufferBundle = gBufferBundleEncoder.finish();
+    
     }
 
     override draw() {
@@ -232,18 +244,28 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
                 depthStoreOp: "store"
             }
         });
-        gBufferPass.setPipeline(this.gBufferPipeline);
-        gBufferPass.setBindGroup(shaders.constants.bindGroup_scene, this.gBufferSceneBindGroup);
 
-        this.scene.iterate(node => {
-            gBufferPass.setBindGroup(shaders.constants.bindGroup_model, node.modelBindGroup);
-        }, material => {
-            gBufferPass.setBindGroup(shaders.constants.bindGroup_material, material.materialBindGroup);
-        }, primitive => {
-            gBufferPass.setVertexBuffer(0, primitive.vertexBuffer);
-            gBufferPass.setIndexBuffer(primitive.indexBuffer, 'uint32');
-            gBufferPass.drawIndexed(primitive.numIndices);
-        });
+        //Code without render bundle
+        // gBufferPass.setPipeline(this.gBufferPipeline);
+        // gBufferPass.setBindGroup(shaders.constants.bindGroup_scene, this.gBufferSceneBindGroup);
+
+        // this.scene.iterate(node => {
+        //     gBufferPass.setBindGroup(shaders.constants.bindGroup_model, node.modelBindGroup);
+        // }, material => {
+        //     gBufferPass.setBindGroup(shaders.constants.bindGroup_material, material.materialBindGroup);
+        // }, primitive => {
+        //     gBufferPass.setVertexBuffer(0, primitive.vertexBuffer);
+        //     gBufferPass.setIndexBuffer(primitive.indexBuffer, 'uint32');
+        //     gBufferPass.drawIndexed(primitive.numIndices);
+        // });
+
+        if (renderer.settings.useRenderBundles) {
+            gBufferPass.executeBundles([this.gBufferBundle]);
+        } else {
+            gBufferPass.setPipeline(this.gBufferPipeline);
+            gBufferPass.setBindGroup(shaders.constants.bindGroup_scene, this.gBufferSceneBindGroup);
+            this.recordSceneDraws(gBufferPass);
+        }
 
         gBufferPass.end();
 

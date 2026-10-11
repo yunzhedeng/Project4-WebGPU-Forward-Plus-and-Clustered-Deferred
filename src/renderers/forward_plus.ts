@@ -13,6 +13,8 @@ export class ForwardPlusRenderer extends renderer.Renderer {
 
     pipeline: GPURenderPipeline;
 
+    sceneBundle: GPURenderBundle; 
+
     constructor(stage: Stage) {
         super(stage);
 
@@ -78,6 +80,16 @@ export class ForwardPlusRenderer extends renderer.Renderer {
                 ]
             }
         });
+
+         const bundleEncoder = renderer.device.createRenderBundleEncoder({
+            label: "Forward+ render bundle",
+            colorFormats: [renderer.canvasFormat],
+            depthStencilFormat: "depth24plus"
+        });
+        bundleEncoder.setPipeline(this.pipeline);
+        bundleEncoder.setBindGroup(shaders.constants.bindGroup_scene, this.sceneUniformsBindGroup);
+        this.recordSceneDraws(bundleEncoder);
+        this.sceneBundle = bundleEncoder.finish();
     }
 
     override draw() {
@@ -109,19 +121,27 @@ export class ForwardPlusRenderer extends renderer.Renderer {
                 depthStoreOp: "store"
             }
         });
-        renderPass.setPipeline(this.pipeline);
+        // renderPass.setPipeline(this.pipeline);
 
-        renderPass.setBindGroup(shaders.constants.bindGroup_scene, this.sceneUniformsBindGroup);
+        // renderPass.setBindGroup(shaders.constants.bindGroup_scene, this.sceneUniformsBindGroup);
 
-        this.scene.iterate(node => {
-            renderPass.setBindGroup(shaders.constants.bindGroup_model, node.modelBindGroup);
-        }, material => {
-            renderPass.setBindGroup(shaders.constants.bindGroup_material, material.materialBindGroup);
-        }, primitive => {
-            renderPass.setVertexBuffer(0, primitive.vertexBuffer);
-            renderPass.setIndexBuffer(primitive.indexBuffer, 'uint32');
-            renderPass.drawIndexed(primitive.numIndices);
-        });
+        // this.scene.iterate(node => {
+        //     renderPass.setBindGroup(shaders.constants.bindGroup_model, node.modelBindGroup);
+        // }, material => {
+        //     renderPass.setBindGroup(shaders.constants.bindGroup_material, material.materialBindGroup);
+        // }, primitive => {
+        //     renderPass.setVertexBuffer(0, primitive.vertexBuffer);
+        //     renderPass.setIndexBuffer(primitive.indexBuffer, 'uint32');
+        //     renderPass.drawIndexed(primitive.numIndices);
+        // });
+
+        if (renderer.settings.useRenderBundles) {
+            renderPass.executeBundles([this.sceneBundle]);
+        } else {
+            renderPass.setPipeline(this.pipeline);
+            renderPass.setBindGroup(shaders.constants.bindGroup_scene, this.sceneUniformsBindGroup);
+            this.recordSceneDraws(renderPass);
+        }
 
         renderPass.end();
 

@@ -36,7 +36,11 @@ This project is a real-time WebGPU renderer that draws the Sponza scene lit by h
 The built-in FPS counter is driven by `requestAnimationFrame`, which is locked to the display's refresh rate (100 Hz on the test machine), so every renderer faster than 10 ms per frame reads exactly 100 FPS and cannot be compared. To get real
 frame times, I added a `benchmark` button to the GUI: it pauses the normal render loop, renders 20 warm-up frames and then 200 frames back-to-back, waits for the GPU to finish, and prints the average **milliseconds per frame** to the browser console. To use it, pick a `mode` and `numLights` in the GUI, click `benchmark`, and read the result in the console. All timings in this README were measured this way.
 
-## Naive Renderer
+The benchmark also reports the CPU time spent inside `draw()` (recording and submitting commands, without waiting for the GPU); see [Render Bundles](#4-render-bundles) for why this was added.
+
+## 1. Naive Renderer
+
+### Overview
 
 The baseline renderer. The scene is rasterized once, and the fragment shader loops over every light in the scene, summing each light's contribution. There is no culling of any kind, so every fragment pays for every light, whether or not the light can reach it. Its cost is O(fragments × lights).
 
@@ -74,6 +78,8 @@ None. This renderer is intentionally the unoptimized reference.
 ---
 
 ## 2. Forward+ Renderer(with light clustering)
+
+### Overview
 
 Forward+ eliminates much of the wasted effort on lighting calculation that occurred due to Naive by doing a pre-calculation step where they determine what lights can possibly have an effect on which portion of the screen. They subdivide the view frustum into 3456 clusters of size 16 x 9 x 24, using exponential depth slices (`z_k = near · (far/near)^(k/24)`), so that the clusters will remain cubical under perspective projection. Each frame, a compute shader is executed, one thread per cluster, which constructs the axis-aligned bounding box for the cluster from its 8 corners in view space, performs a collision test between the light sphere (radius 2) and the bounding box, and stores up to 256 overlapping light indices in a storage buffer. During rendering, each fragment determines the cluster it belongs to using its screen coordinates and view space depth, and iterates over that cluster's lights only.
 
@@ -121,6 +127,8 @@ The 16 × 9 tiles in the cluster grid are obvious and easily identifiable as blo
 ---
 
 ## 3. Clustered Deferred
+
+### Overview
 
 Clustered Deferred uses the exact same light clustering compute pass as the Forward+ pipeline does, except Clustered Deferred renders in two passes so that lighting is computed once per visible pixel. The first pass (G-buffer pass) renders the scene without lighting; all the fragment shader does is write the albedo (in `rgba8unorm`), normals (in `rgba16float`), and positions (in `rgba32float`) of surfaces to three render targets, with the depth test making sure only the closest surface per-pixel is rendered. In the second pass, a fullscreen triangle is drawn; the fragment shader looks up the G-buffer using `textureLoad` and computes the pixel's cluster, then iterates through the cluster's lights and generates the final color.
 
@@ -176,6 +184,57 @@ The G-buffer stores exactly one surface per pixel: everything hidden behind it h
 
 **What causes the difference?** The renderers apply the same clustering pass and the frame for Deferred renderer is computed in just 11.4 ms at 5000 lights; thus, the clustering process takes not more than this time. The additional ~35 ms spent in Forward+ should then be attributed to fragment shading. In Forward+ renderer the loop through cluster lights is executed for each fragment rasterized, while there is lots of overdraw in Sponza (model columns, arches, curtains), which means many fragments are completely lit and then overwritten. In Deferred renderer the loop is executed once for each visible
 fragment. With 100 lights, the loop becomes short, and this gain is small and offset by the cost of G-buffer write/read operations.
+
+## 4. Render Bundles
+
+### Overview
+
+Each frame, every renderer re-records the same commands to draw Sponza (bind groups, vertex/index buffers, and one `drawIndexed` per primitive), even though these commands never change between frames. A render bundle records them when the renderer is created, and each frame replays them with a single
+`executeBundles` call, removing this CPU-side recording cost. Bundles are used for the scene pass in Naive and Forward+, and for the G-buffer
+pass in Clustered Deferred. A `useRenderBundles` checkbox in the GUI turns them on or off for comparison.
+
+**Benchmark change.** Render bundles only save CPU time, but the benchmark's frame time is dominated by the GPU, so the savings would be hidden. I therefore extended the benchmark to also report the CPU time spent in each `draw()` call (recording and submitting commands, without waiting for the GPU).
+
+### Performance
+
+| Renderer           | numLights | Frame time, off (ms) | Frame time, on (ms) | CPU `draw()`, off (ms) | CPU `draw()`, on (ms) |
+| ------------------ | --------: | -------------------: | ------------------: | -----------------------: | ----------------------: |
+| Naive              |       100 |                15.39 |               15.13 |                    0.052 |                   0.010 |
+| Naive              |       500 |                76.01 |               81.74 |                    0.050 |                   0.024 |
+| Forward+           |       100 |                 2.19 |                2.47 |                    0.050 |                   0.021 |
+| Forward+           |       500 |                 7.16 |                9.21 |                    0.060 |                   0.015 |
+| Clustered Deferred |       100 |                 2.07 |                1.97 |                    0.064 |                   0.015 |
+| Clustered Deferred |       500 |                 2.96 |                3.42 |                    0.052 |                   0.023 |
+
+*Each value is a single 200-frame benchmark run, except Naive with 500 lights and bundles on, which is the average of two runs.*
+
+![Render bundles CPU time](img/graph_render_bundles_cpu.png)
+
+### Analysis
+
+#### Performance improvement
+
+Render bundles save the time used for recording a frame in all configurations tested, bringing down average frame recording time from 0.055 ms to 0.018 ms – that is, reducing CPU time for this purpose 3×. This is not surprising because all three renderers tested do the same thing and record the same scene with the same amount of draw calls.
+
+However, frame time does not show any consistent improvement either. It goes both ways (sometimes bundles made Deferred 5% faster, at 100 lights, while making it 15% slower at 500 lights), and the difference is within the fluctuation range measured in the benchmark itself: the Clustered Deferred at 500 lights with bundles measured 3.16, 3.21, and 3.42 ms in three independent runs without changing any code. The reason is that the CPU portion of a frame is negligible. Even in the best case (about 2 ms per frame), frame recording takes just 0.05 ms, which is about 3% of the frame. 0.03 ms of CPU time saved is not enough to make any difference for a frame defined by GPU performance.
+
+#### Best and worst case
+
+- **Best case**: CPU-bound rendering, where recording commands is a large share of the frame. This happens with many draw calls (much larger or more fragmented scenes than Sponza), very cheap shaders, or slow CPUs such as on mobile devices. There, cutting CPU recording time by about 3× would directly shorten the frame.
+- **Worst case**: GPU-bound rendering, which is every case measured here. Naive is the clearest example: at 500 lights its frame takes about 76–82 ms on the GPU, while recording takes 0.05 ms, so the bundle saves less than 0.1% of the frame.
+
+#### Tradeoffs
+
+Once recorded, a render bundle can't change anything it bakes into itself per frame without re-recording it: pipeline, bind groups, buffers, and draw calls list. This is okay in our case since the scene is not dynamic and only its buffer content changes, but that excludes per frame CPU culling (such as removing objects which are not visible in the frustum), addition and deletion of objects, and changing materials unless we will have to record the bundle again. The bundle must be compatible with the render pass in terms of color and depth format, thus each pass layout will have its own bundle.
+
+#### How parameters affect performance
+
+- **Number of lights**: has no effect on the CPU saving. The number of draw calls is the same at 100 and 500 lights, and so is the recording time saved. More lights only increase GPU work, which makes the frame even more GPU-bound and the saving even less visible.
+- **Number of draw calls** (scene complexity): the saving grows with the number of draw calls, because recording cost is per command. This is the parameter that would make render bundles worthwhile.
+
+#### Debug view
+
+Render bundles do not change the image, so there is no meaningful debug view.
 
 ### Credits
 
