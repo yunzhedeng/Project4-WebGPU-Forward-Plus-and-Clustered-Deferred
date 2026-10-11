@@ -23,6 +23,14 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
     fullscreenBindGroupLayout: GPUBindGroupLayout;
     fullscreenBindGroup: GPUBindGroup;
     fullscreenPipeline: GPURenderPipeline;
+
+    compactGBufferTexture: GPUTexture;
+    compactGBufferTextureView: GPUTextureView;
+    compactGBufferPipeline: GPURenderPipeline;
+    compactGBufferBundle: GPURenderBundle;
+    compactFullscreenBindGroupLayout: GPUBindGroupLayout;
+    compactFullscreenBindGroup: GPUBindGroup;
+    compactFullscreenPipeline: GPURenderPipeline;
     
     constructor(stage: Stage) {
         super(stage);
@@ -59,7 +67,7 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
             label: "gbuffer depth",
             size: size,
             format: "depth24plus",
-            usage: GPUTextureUsage.RENDER_ATTACHMENT
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING   
         });
         this.depthTextureView = this.depthTexture.createView();
 
@@ -191,6 +199,100 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
                 ]
             }
         });
+
+        this.compactGBufferTexture = renderer.device.createTexture({
+            label: "compact gbuffer (albedo + normal)",
+            size: size,
+            format: "rg32uint",
+            usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING
+        });
+        this.compactGBufferTextureView = this.compactGBufferTexture.createView();
+
+        this.compactGBufferPipeline = renderer.device.createRenderPipeline({
+            label: "compact g-buffer pipeline",
+            layout: renderer.device.createPipelineLayout({
+                label: "compact g-buffer pipeline layout",
+                bindGroupLayouts: [
+                    this.gBufferSceneBindGroupLayout,
+                    renderer.modelBindGroupLayout,
+                    renderer.materialBindGroupLayout
+                ]
+            }),
+            depthStencil: {
+                depthWriteEnabled: true,
+                depthCompare: "less",
+                format: "depth24plus"
+            },
+            vertex: {
+                module: renderer.device.createShaderModule({
+                    label: "compact g-buffer vert shader",
+                    code: shaders.naiveVertSrc
+                }),
+                buffers: [ renderer.vertexBufferLayout ]
+            },
+            fragment: {
+                module: renderer.device.createShaderModule({
+                    label: "compact g-buffer frag shader",
+                    code: shaders.clusteredDeferredCompactFragSrc
+                }),
+                targets: [ { format: "rg32uint" } ]
+            }
+        });
+
+        this.compactFullscreenBindGroupLayout = renderer.device.createBindGroupLayout({
+            label: "compact fullscreen bind group layout",
+            entries: [
+                { binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },           // camera
+                { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },  // lightSet
+                { binding: 2, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } },  // clusterSet
+                { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "uint" } },        // compact g-buffer
+                { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: "depth" } }        // depth
+            ]
+        });
+
+        this.compactFullscreenBindGroup = renderer.device.createBindGroup({
+            label: "compact fullscreen bind group",
+            layout: this.compactFullscreenBindGroupLayout,
+            entries: [
+                { binding: 0, resource: { buffer: this.camera.uniformsBuffer } },
+                { binding: 1, resource: { buffer: this.lights.lightSetStorageBuffer } },
+                { binding: 2, resource: { buffer: this.lights.clusterSetStorageBuffer } },
+                { binding: 3, resource: this.compactGBufferTextureView },
+                { binding: 4, resource: this.depthTextureView }
+            ]
+        });
+        this.compactFullscreenPipeline = renderer.device.createRenderPipeline({
+            label: "compact fullscreen pipeline",
+            layout: renderer.device.createPipelineLayout({
+                label: "compact fullscreen pipeline layout",
+                bindGroupLayouts: [ this.compactFullscreenBindGroupLayout ]
+            }),
+            vertex: {
+                module: renderer.device.createShaderModule({
+                    label: "compact fullscreen vert shader",
+                    code: shaders.clusteredDeferredFullscreenVertSrc
+                })
+            },
+            fragment: {
+                module: renderer.device.createShaderModule({
+                    label: "compact fullscreen frag shader",
+                    code: shaders.clusteredDeferredCompactFullscreenFragSrc
+                }),
+                targets: [ { format: renderer.canvasFormat } ]
+            }
+        });
+
+        // C4. render bundle for the compact G-buffer pass
+        const compactBundleEncoder = renderer.device.createRenderBundleEncoder({
+            label: "compact G-buffer render bundle",
+            colorFormats: ["rg32uint"],
+            depthStencilFormat: "depth24plus"
+        });
+        compactBundleEncoder.setPipeline(this.compactGBufferPipeline);
+        compactBundleEncoder.setBindGroup(shaders.constants.bindGroup_scene, this.gBufferSceneBindGroup);
+        this.recordSceneDraws(compactBundleEncoder);
+        this.compactGBufferBundle = compactBundleEncoder.finish();
+
         // Pre-record the G-buffer pass draw calls
         const gBufferBundleEncoder = renderer.device.createRenderBundleEncoder({
             label: "G-buffer render bundle",
@@ -213,6 +315,15 @@ export class ClusteredDeferredRenderer extends renderer.Renderer {
 
         //compute pass
         this.lights.doLightClustering(encoder);
+
+        const useCompact = renderer.settings.useCompactGBuffer;
+        const useBundles = renderer.settings.useRenderBundles;
+        const depthAttachment: GPURenderPassDepthStencilAttachment = {
+            view: this.depthTextureView,
+            depthClearValue: 1.0,
+            depthLoadOp: "clear",
+            depthStoreOp: "store"
+        };
         
         //G-buffer pass
         const gBufferPass = encoder.beginRenderPass({

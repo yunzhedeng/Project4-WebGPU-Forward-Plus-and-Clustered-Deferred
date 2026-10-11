@@ -54,12 +54,24 @@ let renderModeController = gui.add({ mode: renderModes.naive }, 'mode', renderMo
 renderModeController.onChange(setRenderer);
 
 gui.add(settings, 'useRenderBundles');
+gui.add(settings, 'useDepthPrepass'); 
+gui.add(settings, 'useClusterCulling'); 
+gui.add(settings, 'useCompactGBuffer');
+gui.add(settings, 'showOverdraw'); 
 
 gui.add({
     benchmark: async () => {
         const { ms, cpuMs } = await renderer!.benchmark(200);
-        console.log(`[benchmark] mode=${renderModeController.getValue()} numLights=${lights.numLights} bundles=${settings.useRenderBundles} -> ${ms.toFixed(3)} ms/frame, CPU draw() ${cpuMs.toFixed(3)} ms`);
+        console.log(`[benchmark] mode=${renderModeController.getValue()} numLights=${lights.numLights} bundles=${settings.useRenderBundles} prepass=${settings.useDepthPrepass} culling=${settings.useClusterCulling} compactGBuffer=${settings.useCompactGBuffer} -> ${ms.toFixed(3)} ms/frame, CPU draw() ${cpuMs.toFixed(3)} ms`);  
     }
 }, 'benchmark');
+
+gui.add({
+    countActiveClusters: async () => {
+        const active = await lights.countActiveClusters();
+        const total = 16 * 9 * 24;
+        console.log(`[clusters] active=${active} / ${total} (${(active / total * 100).toFixed(1)}%)`);
+    }
+}, 'countActiveClusters');
 
 setRenderer(renderModeController.getValue());

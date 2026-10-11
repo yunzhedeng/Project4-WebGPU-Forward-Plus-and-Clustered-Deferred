@@ -23,6 +23,7 @@
 @group(${bindGroup_scene}) @binding(0) var<uniform> cameraUniforms: CameraUniforms;
 @group(${bindGroup_scene}) @binding(1) var<storage, read> lightSet: LightSet;
 @group(${bindGroup_scene}) @binding(2) var<storage, read_write> clusterSet: ClusterSet;
+@group(${bindGroup_scene}) @binding(3) var<storage, read> activeClusters: array<u32>;
 
 const clusterCount = vec3u(${clusterCountX}, ${clusterCountY}, ${clusterCountZ});
 
@@ -38,6 +39,11 @@ fn main(@builtin(global_invocation_id) globalIdx: vec3u) {
     let clusterIdx = globalIdx.x;
     let numClusters = clusterCount.x * clusterCount.y * clusterCount.z;
     if (clusterIdx >= numClusters) {
+        return;
+    }
+
+    if (activeClusters[clusterIdx] == 0u) {
+        clusterSet.clusters[clusterIdx].numLights = 0u;
         return;
     }
 

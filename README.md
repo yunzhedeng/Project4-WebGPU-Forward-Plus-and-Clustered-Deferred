@@ -9,7 +9,7 @@ WebGL Forward+ and Clustered Deferred Shading
 
 ### Live Demo
 
-[![](img/thumb.png)](http://TODO.github.io/Project4-WebGPU-Forward-Plus-and-Clustered-Deferred)
+[![Live demo](img/live_demo.png)](https://yunzhedeng.github.io/Project4-WebGPU-Forward-Plus-and-Clustered-Deferred/)
 
 ### Demo Video/GIF
 
@@ -158,7 +158,7 @@ rises more slowly than that of Forward+, increasing only 0.002 ms for each addit
 
 #### Tradeoffs
 
-Deferred requires an additional three full-screen render targets, each taking up 32 bytes per pixel (8 + 8 + 16). These need to be written in the G-buffer pass and re-read in the lighting pass on every frame, requiring additional memory and bandwidth costs that increase with screen resolution. Since G-buffers contain only one surface per pixel, there is no way of handling transparency or forward passes for MSAA, because the transparent surfaces need to be stored separately in their own forward pass.
+Deferred requires an additional three full-screen render targets, each taking up 28 bytes per pixel (4 + 8 + 16). These need to be written in the G-buffer pass and re-read in the lighting pass on every frame, requiring additional memory and bandwidth costs that increase with screen resolution. Since G-buffers contain only one surface per pixel, there is no way of handling transparency or forward passes for MSAA, because the transparent surfaces need to be stored separately in their own forward pass.
 
 #### How parameters affect performance
 
@@ -235,6 +235,162 @@ Once recorded, a render bundle can't change anything it bakes into itself per fr
 #### Debug view
 
 Render bundles do not change the image, so there is no meaningful debug view.
+
+## 5. Depth Prepass for Forward+
+
+### Overview
+
+Forward+ tests the cluster light loop for every rasterized fragment, even those that will be overwritten by more nearby geometry. Sponza features extensive overdraw (columns, arches, curtains and walls layered on top of each other), hence a lot of the lighting calculations would be wasted. Depth prepass solves this problem by rendering the scene twice. In the first render pass we render depth only: no colors and no lighting, only a minimal fragment shader to discard alpha-tested texels (leaves, chains) so their transparent areas do not contribute to depth. At this point, the depth buffer already stores the closest visible surface for each pixel. In the second render pass, we use the standard Forward+ shading pass but load the depth buffer, set up `less-equal` depth testing and do not write depth. This means that any fragment behind the visible surface is discarded by the depth test before even calling the fragment shader. Hence each visible pixel is lit exactly once, just like in Clustered Deferred, but without the G-buffer.
+
+A `useDepthPrepass` checkbox in the GUI switches between the original single-pass Forward+ and the prepass version. Both paths also work with render bundles: the prepass and the shading pass each have their own bundle.
+
+### Performance
+
+| numLights | Without prepass (ms) | With prepass (ms) | Speedup |
+| --------: | -------------------: | ----------------: | ------: |
+|       100 |                 1.92 |              1.46 |   1.3× |
+|       500 |                 6.80 |              3.20 |   2.1× |
+|      1000 |                15.63 |              6.00 |   2.6× |
+|      2000 |                30.89 |             10.43 |   3.0× |
+|      5000 |                50.72 |             18.36 |   2.8× |
+
+*Forward+ with render bundles enabled, single 200-frame benchmark run per value, same camera position for all runs.*
+
+![Depth prepass](img/graph_depth_prepass.png)
+
+### Analysis
+
+#### Performance improvement
+
+The prepass makes Forward+ faster at every light count, from 1.3× at 100 lights to about 3× at 2000 and 5000 lights (50.7 → 18.4 ms at 5000 lights). A roughly 3× speedup means that, in this view, about two thirds of the fragments shaded by the original Forward+ were hidden fragments whose lighting was thrown away. It increases with the number of lights since the price paid for each unnecessary fragment increases: with more lights, each fragment goes through a longer loop of cluster lights, so ignoring the hidden fragment pays off more.
+
+#### Best and worst case
+
+- **Best case**: many lights with high depth complexity, for instance looking at Sponza’s hall, where many layers of columns and arches overlap. Every concealed piece of geometry would go through an expensive light loop pass, but the pre-pass skips them all.
+- **Worst case**: few lights and little overdraw, such as facing a single wall. The shading pass then saves almost nothing, while the prepass still costs a full extra geometry pass, so the prepass can become pure overhead. Even at 100 lights in this view it still gave a 1.3× speedup, because Sponza has enough overdraw to pay for the extra pass.
+
+#### Tradeoffs
+
+All geometry gets processed twice per frame: every vertex will get transformed twice, all triangles will get rasterized twice, and draw call count will be doubled. Additionally, the prepass fragment shader must sample the diffuse map for alpha-tested materials, so it’s not free either. The cost of extra draw calls on the CPU is concealed in this case by render bundles (CPU `draw()` time was kept at about 0.02 ms), but in the case of a much larger geometry count and inexpensive lighting, the overhead from an extra pass can be more expensive than its benefit.
+
+#### How parameters affect performance
+
+- **Number of lights**: the saving grows with the number of lights, from 0.5 ms at 100 lights to 32 ms at 5000 lights, because each skipped fragment would have run a longer light loop.
+- **Depth complexity / camera view**: the saving is proportional to how much overdraw the view has. Views with many overlapping layers benefit most; views facing a nearby wall benefit least.
+- **Scene geometry**: the cost of the prepass grows with the number of triangles, since all geometry is rendered twice.
+
+#### Debug view: overdraw
+
+| Without prepass                | With prepass                     |
+| ------------------------------ | -------------------------------- |
+| ![](img/overdraw_no_prepass.png) | ![](img/overdraw_with_prepass.png) |
+
+Each fragment that reaches the shading pass's fragment shader adds 0.1 to its pixel (additive blending), so brightness shows how many times a pixel was shaded: dark gray is 1 time, white is 10 or more. The view can be turned on with the `showOverdraw` checkbox in the GUI.
+
+Without the prepass, the image varies widely. The back wall and ceiling are dark (1–2 layers), but the columns, arches, curtains, foliage and chains are much brighter, because many layers of geometry overlap there and each layer runs the full cluster light loop before being overwritten. Foliage and chains are the brightest, since they consist of many thin overlapping alpha-tested cards.
+
+With the prepass, the whole image is a uniform dark gray: every pixel is shaded exactly once. This correlates directly with performance: the average brightness of the left image, a large part of the image shows 3 or more layers, matches the roughly 3× speedup measured at high light counts, since the lighting cost of the shading pass is proportional to the number of shaded fragments.
+
+## 6. Depth-Based Cluster Culling
+
+### Overview
+
+Following the depth prepass, the depth buffer now tells us precisely which surfaces are visible, so almost all clusters will be empty: any cluster that is in the air inside the hall, behind walls, above the ceiling, or below the floor cannot possibly have any visible pixels in it, and consequently, their lists of lights are never read. In another fullscreen pass that occurs following the depth prepass and preceding the light clustering stage, the depth of each pixel is read, view-space depth is reconstructed by applying the inverse projection matrix, the cluster to which the pixel belongs is found using the same mapping as used by the Forward+ fragment shader, and the corresponding bit in the `activeClusters` buffer is set. At the boundary of depth slices, the neighboring slice is also flagged so that floating-point precision issues cannot shift a pixel into an unflagged cluster. Each compute shader thread starts with checking the bit in question, and if it is not active, the light count is set to 0 and the function returns immediately.
+
+**Approach:** inactive clusters are simply skipped (one thread is still dispatched per cluster); no stream compaction is used. The `useClusterCulling` checkbox in the GUI turns culling on and off; it requires the depth prepass. A `countActiveClusters` button reads the flag buffer back to the CPU and reports how many clusters are active.
+
+### Performance
+
+Active clusters in the test view: **289 of 3456 (8.4%)**.
+
+| numLights | Culling off (ms) | Culling on (ms) |
+| --------: | ---------------: | --------------: |
+|       100 |             1.74 |            1.36 |
+|       500 |      2.90 / 4.04 |            3.53 |
+|      1000 |             4.90 |            5.33 |
+|      2000 |            10.17 |           11.18 |
+|      5000 |            14.18 |           14.35 |
+
+*Forward+ with render bundles and depth prepass enabled, same camera position, 200-frame benchmark runs. At 500 lights, two runs with culling off are shown to illustrate the run-to-run variation; the graph uses their average.*
+
+![Cluster culling](img/graph_cluster_culling.png)
+
+### Analysis
+
+#### Performance improvement
+
+Despite that 91.6% of clusters are culled, culling does not make any visible difference – the performance difference is going both ways (faster at 100 lights, slower at 1000 and 2000 lights, and by 1% at 5000 lights: 14.18 vs. 14.35 ms) and it is lower than the variance (two runs at 500 lights give 2.90 and 4.04 ms).
+
+The reason for this is warp divergence. Threads are executed in warps (batches of 32) by GPU and the time to execute a warp depends on its slowest thread. The clustering shader launches one thread per cluster with cluster indices in sequence order inside the warp. Active clusters are rare, but they are scattered all over the entire grid, almost every screen tile has 1-2 active clusters of depth slices. With 8.4% of clusters being active, the probability of having at least one active cluster in a warp of 32 clusters is roughly 1 − 0.916³² ≈ 94%. And in such warp, the active thread will execute a full loop over all lights, while the remaining 31 threads will be idle.
+
+#### Best and worst case
+
+- **Best case**: views where the active clusters are concentrated in a few contiguous groups of indices, so that whole warps become inactive and exit together, combined with many lights so that the skipped light loops are expensive.
+- **Worst case**: what this view shows. The active clusters are spread evenly across the screen, so nearly every warp still has work, and the marking pass becomes pure overhead.
+
+#### Tradeoffs
+
+Culling includes an additional fullscreen pass per frame to read the depth buffer into a storage buffer, in addition to buffer clearing, and requires the presence of the depth prepass to work correctly. Its performance cost depends on the resolution but its benefit on the number of lights. Culling also has a slight correctness issue, due to the fact that cluster indices are computed from depth using two different passes and in the marking pass the neighboring depth slice is marked near the boundaries to avoid holes but mark a few more clusters.
+
+#### How parameters affect performance
+
+- **Number of lights**: the cost of processing each cluster increases with the number of lights, and therefore the saving increases in theory, but due to warp divergence practically nothing of that is actually achieved.
+- **Camera view / scene depth complexity**: the camera view doesn't change the number of active clusters much. The view I used for the benchmark gave 289 active clusters (8.4%), and facing a nearby arch gave 241 (7.0%). I think this is because almost every one of the 16 × 9 screen tiles has some geometry in it, so each tile has at least one active cluster, which means there are always at least 144 (4.2%) active clusters. Most tiles actually have about two, since a tile can see both something close and something far away. So even in the 7.0% case, most warps still have at least one active cluster, and the view doesn't really affect the cost.
+- **Cluster grid size**: a finer grid has a smaller active fraction, but the active clusters are still spread out, so the same divergence problem applies.
+
+#### Debug view: active clusters
+
+Culling doesn't change what the scene looks like, so there isn't really a visual debug view for it. Instead, I added a `countActiveClusters` button to the GUI that copies the active-cluster flags back to the CPU and prints how many clusters are active. In the benchmark view it showed 289 active clusters (8.4%), and facing a nearby arch it showed 241 (7.0%). The number changing with the view also shows that the marking pass is updating every frame. These numbers help explain why culling didn't speed things up: more than 90% of the clusters get skipped, but the active ones are spread out over every screen tile, so almost every warp still has to run the whole light loop.
+
+#### Possible improvement: stream compaction
+
+The divergence problem could be removed with stream compaction: an extra compute pass would gather the indices of the active clusters into a contiguous list (using an atomic counter), and the clustering shader would then run one thread per *list entry* instead of one per cluster. Every warp would then be either fully active or fully idle, so idle warps exit together and the work would drop to roughly the 8.4% of clusters that are actually active. This should turn the culling into a real speedup, especially at high light counts.
+
+## 7. G-buffer Optimization
+
+### Overview
+
+The standard G-buffer makes use of three color attachments (`rgba8unorm` for albedo, `rgba16float` for normal, `rgba32float` for position), 28 bytes per pixel. The improved implementation encodes all information into a single `rg32uint` attachment, 8 bytes per pixel: the first attachment encodes albedo using `pack4x8unorm`, while the second attachment encodes the normal using octahedral encoding with two components encoded using `pack2x16snorm`. World position is not encoded; it is computed during the lighting stage based on depth and the inverse of the projection and rigid view matrices.
+
+This meets the requirement of one color output image with at most one `vec4f` (16 bytes) of data per pixel: the compact G-buffer uses one image with 8 bytes per pixel.
+
+### Performance
+
+| numLights | Original G-buffer (ms) | Compact G-buffer (ms) |
+| --------: | ---------------------: | --------------------: |
+|       100 |                   2.14 |                  2.15 |
+|       500 |                   3.22 |                  3.18 |
+|      1000 |                   4.85 |                  4.73 |
+|      2000 |                   7.53 |                  8.13 |
+|      5000 |                  11.49 |                 12.12 |
+
+*Clustered Deferred with render bundles enabled, same camera position, single 200-frame benchmark run per value.*
+
+![Compact G-buffer](img/graph_compact_gbuffer.png)
+
+### Analysis
+
+#### Performance improvement
+
+This compression of the G-buffer to only 8 bytes per pixel makes the amount of data sent through the G-buffer stage and received back at the lighting stage drop to only 16 bytes from 56 bytes per pixel plus a 4-byte depth read, a reduction by almost 64%. Yet the frame time is unaffected: there are both increases and decreases (−2% for 1000 lights, +8% for 2000 lights) which do not even exceed the noise level of the benchmark run to run. The frame is not bandwidth bound but limited by the lighting loop, and the compact representation adds some arithmetic overhead per pixel which offsets the memory bandwidth savings.
+
+#### Best and worst case
+
+- **Best case**: bandwidth-limited situations, such as high resolutions, few lights (so lighting is cheap), or GPUs with limited memory bandwidth like integrated or mobile GPUs. There, cutting G-buffer traffic by about two thirds would directly shorten the frame.
+- **Worst case**: what this test shows. Many lights and a GPU with plenty of bandwidth, so the lighting loop dominates the frame and the extra unpacking and reconstruction work is all that remains of the change.
+
+#### Tradeoffs
+
+While the tight G-buffer saves on bandwidth at the cost of additional calculations, both in packing during the G-buffer stage and unpacking, octahedral decoding, and reconstructing the position in the lighting stage, it also suffers from a reduced precision of storage: alpha of the albedo is not stored anymore, normals are quantized to 16 bits per channel (which makes only a minor difference of less than 0.004°), and the precision of the position reconstructing is constrained by the depth buffer’s 24-bit precision (and hence is less precise than the 32-bit float position at greater distances from the camera).
+
+#### How parameters affect performance
+
+- **Number of lights**: does not change the G-buffer cost, which depends only on resolution. More lights make the lighting loop dominate even more, so the relative effect of the compact G-buffer shrinks as the number of lights grows.
+- **Resolution**: G-buffer traffic grows linearly with the number of pixels, so the bandwidth saving (about 36 bytes per pixel per frame) becomes more significant at higher resolutions.
+
+#### Debug view
+
+The compact G-buffer produces the same image as the original: switching `useCompactGBuffer` on and off shows no visible difference. In a separate synthetic test with a rotated camera, the two paths differed by at most 1/255 per color channel, which is just 8-bit rounding.
 
 ### Credits
 

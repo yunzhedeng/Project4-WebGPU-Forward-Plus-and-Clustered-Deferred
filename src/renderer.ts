@@ -5,7 +5,11 @@ import { Stage } from './stage/stage';
 import * as shaders from './shaders/shaders';
 
 export const settings = {
-    useRenderBundles: true
+    useRenderBundles: true,
+    useDepthPrepass: true,
+    useClusterCulling: true, 
+    useCompactGBuffer: true,  
+    showOverdraw: false   
 };
 
 export var canvas: HTMLCanvasElement;
@@ -144,7 +148,7 @@ export abstract class Renderer {
     protected abstract draw(): void;
 
     //benchmark
-    async benchmark(frames: number = 200, warmup: number = 20): Promise<number> {
+    async benchmark(frames: number = 200, warmup: number = 20): Promise<{ ms: number, cpuMs: number }> {
         cancelAnimationFrame(this.frameRequestId);
 
         for (let i = 0; i < warmup; i++) {
